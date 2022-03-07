@@ -13,3 +13,9 @@ tokio = { version = "1.17.0", features = ["full"] }
 dxgcap = "0.2.4"
 glam = "0.20.2"
 color-thief = "0.2.1"
+image = "0.24"
+color_quant = "1.0"
+itertools = "0.3"
+clippy = { version = "0.0.15", optional = true }
+hsl = "0.1"
+palette = "0.6.0"

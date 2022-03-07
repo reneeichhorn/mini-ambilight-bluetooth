@@ -10,18 +10,30 @@ use dxgcap::DXGIManager;
 use futures::stream::StreamExt;
 use glam::*;
 
+use image::{
+  imageops::FilterType,
+  DynamicImage::{self, ImageRgb8},
+  ImageBuffer,
+};
+use palette::{rgb::Rgb, FromColor, Hsl, IntoColor};
 use uuid::Uuid;
+
+mod vibrant;
 
 const LIGHT_MAC: u64 = 0xFFFF3A00028F;
 const LIGHT_CONTROL_UUID: Uuid = uuid_from_u16(0xFFF1);
 
 const CAPTURE_DEVICE: usize = 1;
 
-const COLOR_GAMMA: f32 = 1.4;
-const COLOR_ALGORITHM: ColorSamplingAlgorithm = ColorSamplingAlgorithm::MostDominant {
+const COLOR_GAMMA: f32 = 1.0;
+const COLOR_FADE: f32 = 0.8;
+const COLOR_CORRECT_LIGHT: f32 = 0.9;
+const COLOR_CORRECT_SATURATION: f32 = 0.9;
+/*const COLOR_ALGORITHM: ColorSamplingAlgorithm = ColorSamplingAlgorithm::MostDominant {
   quality: 2,
-  sorted: false,
-};
+  sorted: true,
+};*/
+const COLOR_ALGORITHM: ColorSamplingAlgorithm = ColorSamplingAlgorithm::Vibrancy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   dxgi.set_capture_source_index(CAPTURE_DEVICE);
   //dxgi.acquire_output_duplication().unwrap();
 
+  let mut previous_pixel = Vec3::ZERO;
   loop {
     let (buffer, (width, height)) = dxgi
       .capture_frame()
@@ -108,8 +121,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let color = Vec3::new(dominant.r as f32, dominant.g as f32, dominant.b as f32);
         color / 255.0
       }
+      ColorSamplingAlgorithm::Vibrancy => {
+        let pixels = buffer
+          .iter()
+          .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+          .collect::<Vec<_>>();
+        let image = DynamicImage::ImageRgb8(
+          ImageBuffer::from_raw(width as u32, height as u32, pixels).unwrap(),
+        )
+        .resize(
+          (width as f32 * 0.05) as u32,
+          (height as f32 * 0.05) as u32,
+          FilterType::Nearest,
+        );
+        let vibrancy = vibrant::Vibrancy::new(&image);
+        let color = vibrancy
+          .primary
+          .or(vibrancy.light)
+          .or(vibrancy.light_muted)
+          .or(vibrancy.muted)
+          .or(vibrancy.dark_muted)
+          .or(vibrancy.dark)
+          .unwrap_or_else(|| image::Rgb([0, 0, 0]));
+        Vec3::new(color.0[0] as f32, color.0[1] as f32, color.0[2] as f32) / 255.0
+      }
     };
-    let color = color.powf(1.0 / COLOR_GAMMA).min(Vec3::splat(1.0)) * 255.0;
+
+    let color = color.powf(1.0 / COLOR_GAMMA);
+    let mut hsl: Hsl = Rgb::new(color.x, color.y, color.z).into_color();
+    hsl.lightness = mix(hsl.lightness, 0.5, COLOR_CORRECT_LIGHT);
+    hsl.saturation = mix(hsl.saturation, 1.0, COLOR_CORRECT_SATURATION);
+    let rgb: Rgb = hsl.into_color();
+    let color = Vec3::new(rgb.red, rgb.green, rgb.blue);
+    let color = previous_pixel * COLOR_FADE + color * (1.0 - COLOR_FADE);
+    previous_pixel = color;
+    let color = (color * 255.0).min(Vec3::splat(255.0));
+    println!("Color grabbed {}", color);
     let color_cmd = vec![0x01, color.x as u8, color.y as u8, color.z as u8, 0x64];
     light
       .write(cmd_char, &color_cmd, WriteType::WithoutResponse)
@@ -117,7 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
 }
 
+fn mix(x: f32, y: f32, weight: f32) -> f32 {
+  (x * x * (1.0 - weight) + y * y * weight).sqrt()
+}
 enum ColorSamplingAlgorithm {
   SquaredAverage { sample_rate: f32 },
   MostDominant { quality: u8, sorted: bool },
+  Vibrancy,
 }
